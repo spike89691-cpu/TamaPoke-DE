@@ -43,9 +43,9 @@ jobs:
           FQBN='esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB'
           mkdir -p "$RUNNER_TEMP/esp32-build"
           arduino-cli compile --fqbn "$FQBN" --output-dir "$RUNNER_TEMP/esp32-build" .
-BOOT_APP=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -type f -name boot_app0.bin -print -quit)
-test -f "$BOOT_APP"
-cp "$BOOT_APP" "$RUNNER_TEMP/esp32-build/boot_app0.bin"
+          BOOT_APP=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -type f -name boot_app0.bin -print -quit)
+          test -f "$BOOT_APP"
+          cp "$BOOT_APP" "$RUNNER_TEMP/esp32-build/boot_app0.bin"
           ls -lah "$RUNNER_TEMP/esp32-build"
 
       - name: Sicheres Web-Flash-Paket bauen und prüfen
