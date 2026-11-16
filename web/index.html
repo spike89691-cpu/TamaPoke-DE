@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f1e8">
+  <title>TamaPoke - Installer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@500;600&amp;family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="https://github.com/reallyjustsomeguy/TamaPokeLANExp" target="_blank" rel="noreferrer">
+      <span class="brand-mark" aria-hidden="true"><span></span></span>
+      <span>TamaPoke</span>
+    </a>
+    <span class="device-label">ESP32-S3 / 466 AMOLED</span>
+  </header>
+
+  <main class="shell">
+    <section class="intro" aria-labelledby="page-title">
+      <div class="intro-copy">
+        <p class="eyebrow">Firmware and SD manager</p>
+        <h1 id="page-title">Build your TamaPoke.</h1>
+        <p>Flash the board, install only the regions you need, and keep a restorable copy of your trainer, Pokemon, party, box, badges, and settings.</p>
+        <div class="compatibility">
+          <span class="signal signal-ready" aria-hidden="true"></span>
+          Chrome or Edge on macOS, Windows, or Linux
+        </div>
+      </div>
+      <div class="device-preview" aria-label="TamaPoke running on its round display">
+        <img src="../docs/screens/main.png" alt="TamaPoke main pet screen">
+        <img src="../docs/screens/player.png" alt="TamaPoke trainer screen">
+      </div>
+    </section>
+
+    <div class="notice notice-error" id="unsupported" hidden>
+      <i data-lucide="circle-alert" aria-hidden="true"></i>
+      <div><strong>Web Serial is not available.</strong> Open this page in desktop Chrome or Edge.</div>
+    </div>
+
+    <section class="work-section" aria-labelledby="firmware-title">
+      <header class="section-heading">
+        <span class="step-number">01</span>
+        <div>
+          <p class="eyebrow">Board firmware</p>
+          <h2 id="firmware-title">Choose a version and flash</h2>
+        </div>
+      </header>
+
+      <div class="edition-grid" id="editions" aria-live="polite">
+        <p class="muted">Loading firmware catalogue...</p>
+      </div>
+
+      <div class="action-row flash-row">
+        <button class="button button-primary" id="backup-flash">
+          <i data-lucide="shield-check" aria-hidden="true"></i>
+          <span id="backup-flash-label">Backup, then install</span>
+        </button>
+        <esp-web-install-button id="flash-button" manifest="manifest.json">
+          <button class="button button-primary" slot="activate" id="install-step2" hidden>
+            <i data-lucide="cpu" aria-hidden="true"></i>
+            Install update
+          </button>
+          <span slot="unsupported">Use Chrome or Edge to flash this board.</span>
+          <span slot="not-allowed">This installer requires HTTPS.</span>
+        </esp-web-install-button>
+        <button class="button button-quiet button-small" id="install-skip">Install without backup</button>
+        <p class="action-copy" id="edition-summary">The standard edition includes every game feature and loads region art from microSD.</p>
+      </div>
+      <p class="action-copy"><strong>Backup, then install</strong> reads the save off the board, checks it, downloads it and keeps a copy in this browser. Once it's done, the button reads <strong>Backup complete, now →</strong> and <strong>Install update</strong> appears next to it -- click that to flash. Your browser will ask which board to use twice: once to read the save, once to flash. A brand-new board has nothing to back up and goes straight there. Prefer to skip the backup entirely? Use <strong>Install without backup</strong> instead.</p>
+
+      <section class="release-notes" aria-labelledby="release-notes-title">
+        <header>
+          <div>
+            <p class="eyebrow">Changelog</p>
+            <h3 id="release-notes-title">Current Pages build</h3>
+          </div>
+          <a id="release-link" href="https://github.com/reallyjustsomeguy/TamaPokeLANExp/releases" target="_blank" rel="noreferrer">All releases</a>
+        </header>
+        <pre id="release-notes-body">Loading version notes...</pre>
+      </section>
+
+      <details class="install-note">
+        <summary><i data-lucide="shield-check" aria-hidden="true"></i> Updating an existing board</summary>
+        <p>Leave <strong>Erase device</strong> unchecked. A normal update preserves the save in flash and every sprite on the microSD. Erasing has no undo, so make a backup below first.</p>
+        <p>A brand-new board may only appear in download mode: hold <strong>BOOT</strong>, tap <strong>RESET</strong>, then release <strong>BOOT</strong>.</p>
+      </details>
+    </section>
+
+    <section class="work-section" aria-labelledby="packs-title">
+      <header class="section-heading section-heading-split">
+        <div class="heading-group">
+          <span class="step-number">02</span>
+          <div>
+            <p class="eyebrow">microSD library</p>
+            <h2 id="packs-title">Sync region packs</h2>
+          </div>
+        </div>
+        <div class="connection" id="connection-state">
+          <span class="signal" aria-hidden="true"></span>
+          <span>Board not connected</span>
+        </div>
+      </header>
+
+      <div class="connect-strip">
+        <button class="button button-primary" id="connect">
+          <i data-lucide="usb" aria-hidden="true"></i>
+          Connect board
+        </button>
+        <p>One connection manages packs and saves. Close the firmware install dialog before connecting here.</p>
+      </div>
+
+      <div class="pack-toolbar">
+        <div>
+          <h3>Available regions</h3>
+          <p id="catalogue-summary">Loading pack catalogue...</p>
+        </div>
+        <div class="toolbar-actions">
+          <button class="button button-quiet button-small" id="refresh-packs" disabled title="Read installed packs again">
+            <i data-lucide="refresh-cw" aria-hidden="true"></i>
+            Refresh
+          </button>
+          <button class="button button-quiet button-small" id="select-needed" disabled>Select needed</button>
+        </div>
+      </div>
+
+      <div class="region-grid" id="regions" aria-live="polite"></div>
+
+      <div class="deploy-bar">
+        <div>
+          <strong id="selection-title">No packs selected</strong>
+          <span id="selection-detail">Connect a board to compare its SD card.</span>
+        </div>
+        <button class="button button-accent" id="install" disabled>
+          <i data-lucide="download" aria-hidden="true"></i>
+          Install selected
+        </button>
+      </div>
+
+      <div class="progress" id="progress" hidden>
+        <div class="progress-copy">
+          <span id="progress-label">Preparing transfer...</span>
+          <span id="progress-value">0%</span>
+        </div>
+        <div class="progress-track"><div id="progress-fill"></div></div>
+      </div>
+
+      <div class="custom-pack">
+        <i data-lucide="file-up" aria-hidden="true"></i>
+        <span>Generated your own sprite files?</span>
+        <label class="text-action">Choose .bin files<input id="files" type="file" accept=".bin" multiple disabled hidden></label>
+      </div>
+    </section>
+
+    <section class="work-section" aria-labelledby="save-title">
+      <header class="section-heading">
+        <span class="step-number">03</span>
+        <div>
+          <p class="eyebrow">Save vault</p>
+          <h2 id="save-title">Back up or restore your game</h2>
+        </div>
+      </header>
+      <div class="save-layout">
+        <div>
+          <h3>Download backup</h3>
+          <p>Exports the complete save from internal flash: the live Pokemon, party, box, Pokedex, badges, inventory, and settings.</p>
+          <button class="button button-secondary" id="backup" disabled>
+            <i data-lucide="hard-drive-download" aria-hidden="true"></i>
+            Download save
+          </button>
+        </div>
+        <div>
+          <h3>Restore backup</h3>
+          <p>This page checks the length, format and checksum before sending anything, and the firmware validates it again before replacing your save, then restarts.</p>
+          <label class="button button-secondary button-file" id="restore-label" aria-disabled="true">
+            <i data-lucide="hard-drive-upload" aria-hidden="true"></i>
+            Restore save
+            <input id="restore" type="file" accept=".tpsave,.txt" disabled hidden>
+          </label>
+        </div>
+      </div>
+
+      <section class="release-notes" aria-labelledby="history-title">
+        <header>
+          <div>
+            <p class="eyebrow">Recent backups</p>
+            <h3 id="history-title">Kept in this browser</h3>
+          </div>
+          <button class="button button-secondary" id="history-clear" disabled>Clear</button>
+        </header>
+        <p class="action-copy">A convenience, not a backup. These live only in this browser on this computer, and are lost if you clear site data, use private browsing, or move to another machine. <strong>The downloaded <code>.tpsave</code> file is the real backup</strong> &mdash; keep it somewhere you trust.</p>
+        <div id="history" aria-live="polite"></div>
+      </section>
+    </section>
+
+    <section class="activity" aria-labelledby="activity-title">
+      <header>
+        <div>
+          <p class="eyebrow">Live output</p>
+          <h2 id="activity-title">Activity</h2>
+        </div>
+        <button class="icon-button" id="clear-log" title="Clear activity log" aria-label="Clear activity log">
+          <i data-lucide="trash-2" aria-hidden="true"></i>
+        </button>
+      </header>
+      <pre id="log" aria-live="polite">Ready. Flash the firmware or connect a running board.</pre>
+    </section>
+  </main>
+
+  <footer>
+    <span>Personal, non-commercial fan project.</span>
+    <span>Sprites: <a href="https://github.com/PMDCollab/SpriteCollab" target="_blank" rel="noreferrer">PMD SpriteCollab</a> (CC BY-NC)</span>
+    <a href="https://github.com/reallyjustsomeguy/TamaPokeLANExp" target="_blank" rel="noreferrer">Source and game manual</a>
+  </footer>
+
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js"></script>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  <script type="module" src="installer.js?v=fb66ec956a3147a4"></script>
+</body>
+</html>

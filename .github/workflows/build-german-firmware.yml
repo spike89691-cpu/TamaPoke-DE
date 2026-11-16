@@ -1,0 +1,80 @@
+name: Deutsche Pokemon-Namen – Firmware bauen und Web-Installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    name: ESP32-S3-Firmware kompilieren
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Quellcode holen
+        uses: actions/checkout@v4
+
+      - name: Arduino CLI installieren
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: ESP32-S3-Boardpaket und Bibliotheken installieren
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index --additional-urls "$URL"
+          arduino-cli core install esp32:esp32 --additional-urls "$URL"
+          arduino-cli lib update-index
+          arduino-cli lib install "GFX Library for Arduino"
+          arduino-cli lib install "SensorLib"
+          arduino-cli lib install "XPowersLib"
+
+      - name: Deutsche Namen und JS-Sicherungen prüfen
+        run: |
+          python3 tools/check_german_names.py
+          node tools/check_savefile.mjs
+          g++ -std=c++17 -O1 -Itools/emu -I. tools/emu/tests/german_names_test.cpp i18n.cpp tools/emu/nvsinfo_stub.cpp -o /tmp/test_german_names
+          /tmp/test_german_names
+
+      - name: Firmware kompilieren
+        shell: bash
+        run: |
+          set -euo pipefail
+          FQBN='esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB'
+          mkdir -p "$RUNNER_TEMP/esp32-build"
+          arduino-cli compile --fqbn "$FQBN" --output-dir "$RUNNER_TEMP/esp32-build" .
+          ls -lah "$RUNNER_TEMP/esp32-build"
+
+      - name: Sicheres Web-Flash-Paket bauen und prüfen
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/package_german_webflash.py --built-dir "$RUNNER_TEMP/esp32-build" --out "$RUNNER_TEMP/german-webflash"
+
+      - name: Firmware und lokalen Installer zum Download bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: TamaPoke-DE-Web-Installer
+          path: ${{ runner.temp }}/german-webflash/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Für GitHub Pages vorbereiten
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/german-webflash/
+
+  pages:
+    name: Web-Installer auf GitHub Pages bereitstellen
+    needs: firmware
+    runs-on: ubuntu-22.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Installer veröffentlichen
+        id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,1096 @@
+import { verifyBackup, describeBackup, sendBackup } from './savefile.js?v=1e0c9406aa8d98ea';
+
+const byId = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const MB = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+const titleCase = (value) => value.charAt(0).toUpperCase() + value.slice(1);
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const PACK_QUERY_TIMEOUT_MS = 20000;
+const PACK_COMMIT_TIMEOUT_MS = 30000;
+
+let editions = [];
+let packs = {};
+let port = null;
+let reader = null;
+let writer = null;
+let readCarry = '';
+let readQueue = [];
+let readWaiters = [];
+let packProtocol = false;
+let sdAvailable = true;
+let busy = false;
+// A label, and only a label. It comes from the board's efuse MAC so that two
+// devices' backups can be told apart in the history list. It is NOT a secret and
+// NOT a key: nothing is authorised by it, which is exactly why the history stays
+// in this browser instead of on a server somewhere keyed by it.
+let boardId = '';
+const installedPacks = new Map();
+const REQUIRED_FLASH_PARTS = new Map([
+  [0, 'firmware/bootloader.bin'],
+  [0x8000, 'firmware/partitions.bin'],
+  [0xe000, 'firmware/boot_app0.bin'],
+  [0x10000, 'firmware/app.bin'],
+]);
+const verifiedPacks = new Map();
+
+const logElement = byId('log');
+function log(message) {
+  const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  logElement.textContent += `${logElement.textContent ? '\n' : ''}[${stamp}] ${message}`;
+  logElement.scrollTop = logElement.scrollHeight;
+}
+
+function refreshIcons() {
+  if (window.lucide) window.lucide.createIcons();
+}
+
+async function loadJson(path, options = {}) {
+  const response = await fetch(path, { cache: 'no-cache', ...options });
+  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+  return response.json();
+}
+
+const normalizeVersion = (value) => String(value || '').trim().replace(/^v/i, '');
+
+function validateReleaseManifest(manifest, tag) {
+  if (normalizeVersion(manifest.version) !== normalizeVersion(tag)) return false;
+  if (manifest.new_install_prompt_erase !== true) return false;
+  const build = (manifest.builds || []).find((item) => item.chipFamily === 'ESP32-S3');
+  if (!build || !Array.isArray(build.parts) || build.parts.length !== REQUIRED_FLASH_PARTS.size) return false;
+  return build.parts.every((part) => {
+    const expectedPath = REQUIRED_FLASH_PARTS.get(Number(part.offset));
+    const path = typeof part.path === 'string' ? part.path.split('?', 1)[0] : '';
+    return path === expectedPath;
+  });
+}
+
+function releaseManifestUrl(repository, tag) {
+  const [owner, name] = repository.split('/');
+  return `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${encodeURIComponent(tag)}/web/manifest.json`;
+}
+
+async function loadReleaseVersions(config) {
+  if (!config.repository) return [];
+  const [owner, name] = config.repository.split('/');
+  if (!owner || !name) throw new Error('editions.json repository must be owner/name');
+  const count = Math.max(1, Math.min(Number(config.maxReleases) || 8, 20));
+  const api = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases?per_page=${count}`;
+  const releases = await loadJson(api, { headers: { Accept: 'application/vnd.github+json' } });
+  const checked = await Promise.all(releases.filter((release) => !release.draft).map(async (release) => {
+    const manifestUrl = releaseManifestUrl(config.repository, release.tag_name);
+    try {
+      const manifest = await loadJson(manifestUrl);
+      if (!validateReleaseManifest(manifest, release.tag_name)) {
+        log(`Skipped release ${release.tag_name}: its tag and safe flash manifest do not agree.`);
+        return null;
+      }
+      const date = release.published_at ? new Date(release.published_at) : null;
+      return {
+        id: `release-${release.id}`,
+        name: release.name || `TamaPoke ${release.tag_name}`,
+        channel: release.prerelease ? 'Preview' : 'Release',
+        manifest: manifestUrl,
+        version: normalizeVersion(manifest.version),
+        description: date && !Number.isNaN(date.valueOf())
+          ? `Published ${date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}.`
+          : 'Published on GitHub Releases.',
+        notes: release.body && release.body.trim() ? release.body.trim() : 'No changelog was provided for this release.',
+        releaseUrl: release.html_url,
+        prerelease: release.prerelease,
+      };
+    } catch (error) {
+      log(`Skipped release ${release.tag_name}: ${error.message}`);
+      return null;
+    }
+  }));
+  return checked.filter(Boolean);
+}
+
+function appendEditionCard(host, edition, selected) {
+  const option = document.createElement('div');
+  option.className = `edition-option${selected ? ' selected' : ''}`;
+  const label = document.createElement('label');
+  const input = document.createElement('input');
+  input.type = 'radio';
+  input.name = 'edition';
+  input.value = edition.id;
+  input.checked = selected;
+  input.addEventListener('change', () => selectEdition(edition.id));
+
+  const control = document.createElement('span');
+  control.className = 'choice-control';
+  control.setAttribute('aria-hidden', 'true');
+  const copy = document.createElement('span');
+  copy.className = 'option-copy';
+  const title = document.createElement('span');
+  title.className = 'option-title';
+  const name = document.createElement('span');
+  name.textContent = edition.name;
+  const channel = document.createElement('span');
+  channel.className = 'tag';
+  channel.textContent = edition.channel || 'Build';
+  const description = document.createElement('p');
+  description.textContent = edition.description;
+  const version = document.createElement('span');
+  version.className = 'pack-version';
+  version.textContent = `v${edition.version}`;
+  title.append(name, channel);
+  copy.append(title, description, version);
+  label.append(input, control, copy);
+  option.append(label);
+  host.append(option);
+}
+
+async function loadEditions() {
+  let config;
+  try {
+    config = await loadJson('editions.json');
+  } catch (error) {
+    config = { current: {} };
+    log(`Firmware catalogue fallback: ${error.message}`);
+  }
+
+  const currentConfig = config.current || {};
+  const currentManifestPath = currentConfig.manifest || 'manifest.json';
+  let currentManifest = { version: 'unknown' };
+  try { currentManifest = await loadJson(currentManifestPath); }
+  catch (error) { log(`Current firmware manifest unavailable: ${error.message}`); }
+  const current = {
+    id: 'current',
+    name: currentConfig.name || 'Current Pages build',
+    channel: currentConfig.channel || 'Unreleased',
+    manifest: currentManifestPath,
+    version: normalizeVersion(currentManifest.version) || 'unknown',
+    description: currentConfig.description || 'The build currently hosted by this GitHub Pages site.',
+    notes: currentConfig.notes || 'This build has not been published as an immutable GitHub Release yet.',
+    releaseUrl: `https://github.com/${config.repository || 'reallyjustsomeguy/TamaPokeLANExp'}/releases`,
+  };
+
+  let released = [];
+  try { released = await loadReleaseVersions(config); }
+  catch (error) { log(`GitHub Releases unavailable; showing the current build only: ${error.message}`); }
+  const hasCurrentRelease = released.some((edition) => edition.version === current.version);
+  editions = hasCurrentRelease ? released : [...released, current];
+  const recommended = editions.find((edition) => !edition.prerelease) || editions[0] || current;
+
+  const host = byId('editions');
+  host.textContent = '';
+  host.classList.toggle('single', editions.length === 1);
+  for (const edition of editions) appendEditionCard(host, edition, edition.id === recommended.id);
+  selectEdition(recommended.id);
+}
+
+function selectEdition(id) {
+  const edition = editions.find((item) => item.id === id);
+  if (!edition) return;
+  for (const option of document.querySelectorAll('.edition-option')) {
+    option.classList.toggle('selected', option.querySelector('input').value === id);
+  }
+  const flashButton = byId('flash-button');
+  flashButton.manifest = edition.manifest;
+  flashButton.setAttribute('manifest', edition.manifest);
+  byId('edition-summary').textContent = edition.description;
+  const versionLabel = `v${edition.version}`;
+  byId('release-notes-title').textContent = edition.name.toLowerCase().includes(versionLabel.toLowerCase())
+    ? edition.name
+    : `${edition.name} - ${versionLabel}`;
+  byId('release-notes-body').textContent = edition.notes;
+  const releaseLink = byId('release-link');
+  releaseLink.href = edition.releaseUrl;
+  releaseLink.textContent = edition.id === 'current' ? 'All releases' : 'View on GitHub';
+}
+
+async function loadPacks() {
+  try {
+    const catalogue = await loadJson('paks.json');
+    packs = catalogue.regions || {};
+    renderPacks();
+    const count = Object.keys(packs).length;
+    const bytes = Object.values(packs).reduce((total, pack) => total + pack.bytes, 0);
+    byId('catalogue-summary').textContent = `${count} published region${count === 1 ? '' : 's'}, ${MB(bytes)} total.`;
+  } catch (error) {
+    byId('regions').innerHTML = '<p class="muted">The region catalogue could not be loaded.</p>';
+    byId('catalogue-summary').textContent = error.message;
+    log(`Pack catalogue failed: ${error.message}`);
+  }
+}
+
+function sortedPacks() {
+  return Object.entries(packs).sort((left, right) => left[1].index - right[1].index);
+}
+
+function renderPacks() {
+  const host = byId('regions');
+  host.textContent = '';
+  for (const [region, meta] of sortedPacks()) {
+    const option = document.createElement('div');
+    option.className = 'pack-option';
+    option.dataset.region = region;
+    option.innerHTML = `
+      <label>
+        <input type="checkbox" data-region="${region}" disabled>
+        <span class="choice-control" aria-hidden="true"></span>
+        <span class="option-copy">
+          <span class="option-title"><span>${titleCase(region)}</span><span class="pack-state">Not checked</span></span>
+          <p>${meta.sprites} files / ${MB(meta.bytes)}</p>
+          <span class="pack-version">web ${meta.crc32}</span>
+        </span>
+      </label>`;
+    const input = option.querySelector('input');
+    input.addEventListener('change', () => {
+      option.classList.toggle('selected', input.checked);
+      refreshSelection();
+    });
+    host.append(option);
+  }
+  syncControls();
+}
+
+function emitLine(line) {
+  const clean = line.replace(/\r$/, '').trim();
+  const waiter = readWaiters.shift();
+  if (waiter) {
+    clearTimeout(waiter.timer);
+    waiter.resolve(clean);
+  } else {
+    readQueue.push(clean);
+  }
+}
+
+async function pumpSerial(activeReader) {
+  const decoder = new TextDecoder();
+  try {
+    while (reader === activeReader) {
+      const { value, done } = await activeReader.read();
+      if (done) break;
+      readCarry += decoder.decode(value, { stream: true });
+      let newline;
+      while ((newline = readCarry.indexOf('\n')) >= 0) {
+        emitLine(readCarry.slice(0, newline));
+        readCarry = readCarry.slice(newline + 1);
+      }
+    }
+  } catch (error) {
+    if (writer) log(`Serial connection closed: ${error.message}`);
+  } finally {
+    if (reader === activeReader) setConnected(false, 'Board disconnected');
+  }
+}
+
+function readLine(timeoutMs = 6000) {
+  if (readQueue.length) return Promise.resolve(readQueue.shift());
+  return new Promise((resolve) => {
+    const waiter = { resolve, timer: null };
+    waiter.timer = setTimeout(() => {
+      const index = readWaiters.indexOf(waiter);
+      if (index >= 0) readWaiters.splice(index, 1);
+      resolve(null);
+    }, timeoutMs);
+    readWaiters.push(waiter);
+  });
+}
+
+async function writeLine(line) {
+  if (!writer) throw new Error('Board is not connected.');
+  await writer.write(enc.encode(`${line}\n`));
+}
+
+async function waitForAny(tokens, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const line = await readLine(deadline - Date.now());
+    if (line === null) return null;
+    if (tokens.includes(line)) return line;
+  }
+  return null;
+}
+
+async function commandLines(command, timeoutMs = 6000) {
+  readQueue = [];
+  await writeLine(command);
+  const lines = [];
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const line = await readLine(deadline - Date.now());
+    if (line === null) return { outcome: null, lines };
+    if (line === 'DONE' || line === 'ERR') return { outcome: line, lines };
+    lines.push(line);
+  }
+  return { outcome: null, lines };
+}
+
+async function expectDone(command, timeoutMs = 6000) {
+  readQueue = [];
+  await writeLine(command);
+  return (await waitForAny(['DONE', 'ERR'], timeoutMs)) === 'DONE';
+}
+
+function setConnected(connected, message = connected ? 'Board connected' : 'Board not connected') {
+  const state = byId('connection-state');
+  state.classList.toggle('connected', connected);
+  state.querySelector('span:last-child').textContent = message;
+  if (!connected) {
+    writer = null;
+    reader = null;
+  }
+  syncControls();
+}
+
+// Hands the serial port back to the browser properly.
+//
+// setConnected(false) only forgets our references to the reader and writer. That
+// is enough for the UI, and it was all this page ever needed while installing was
+// something you did in a separate dialog with the connection closed by hand. It
+// is NOT enough to let go of the port: the locks stay held and the port stays
+// open, so esp-web-tools cannot claim it and the flash fails with the device
+// already in use. Anything that wants to hand off has to come through here.
+//
+// Every step is best-effort on purpose. A board that has just restarted (which is
+// exactly what a restore does) throws from cancel() and close(), and failing to
+// tidy up must not become the error the player sees.
+async function releasePort(message = 'Board not connected') {
+  const hadReader = reader;
+  const hadWriter = writer;
+  const hadPort = port;
+  reader = null;                      // stops pumpSerial's loop, which watches this
+  writer = null;
+  port = null;
+  readCarry = '';
+  readQueue = [];
+  readWaiters = [];
+  packProtocol = false;
+  try { await hadReader?.cancel(); } catch { /* already gone */ }
+  try { hadReader?.releaseLock(); } catch { /* already released */ }
+  try { hadWriter?.releaseLock(); } catch { /* already released */ }
+  try { await hadPort?.close(); } catch { /* already closed */ }
+  setConnected(false, message);
+}
+
+function setBusy(value) {
+  busy = value;
+  syncControls();
+}
+
+function syncControls() {
+  const connected = Boolean(writer);
+  byId('connect').disabled = busy || connected || !('serial' in navigator);
+  byId('refresh-packs').disabled = busy || !connected;
+  byId('select-needed').disabled = busy || !connected || !Object.keys(packs).length;
+  byId('backup').disabled = busy || !connected;
+  byId('restore').disabled = busy || !connected;
+  byId('restore-label').setAttribute('aria-disabled', String(busy || !connected));
+  byId('files').disabled = busy || !connected;
+  for (const input of document.querySelectorAll('[data-region]')) input.disabled = busy || !connected;
+  refreshSelection();
+}
+
+function statusFor(meta) {
+  if (!writer) return { text: 'Connect to inspect', kind: '', needed: false };
+  if (!packProtocol) return { text: 'Version unknown', kind: 'update', needed: false };
+  if (!sdAvailable) return { text: 'No SD card', kind: 'update', needed: false };
+  const installed = installedPacks.get(meta.index) || 'missing';
+  if (installed === meta.crc32.toLowerCase()) return { text: 'Current', kind: 'current', needed: false };
+  if (installed === 'legacy') return { text: 'Installed / unversioned', kind: 'update', needed: false };
+  if (/^[0-9a-f]{8}$/.test(installed)) return { text: 'Update available', kind: 'update', needed: true };
+  return { text: 'Not installed', kind: 'missing', needed: true };
+}
+
+function updatePackStatuses() {
+  for (const [region, meta] of sortedPacks()) {
+    const option = document.querySelector(`.pack-option[data-region="${region}"]`);
+    if (!option) continue;
+    const status = statusFor(meta);
+    const badge = option.querySelector('.pack-state');
+    badge.textContent = status.text;
+    badge.className = `pack-state ${status.kind}`.trim();
+    option.dataset.current = String(status.kind === 'current');
+    option.dataset.needed = String(status.needed);
+    if (!status.needed) {
+      const input = option.querySelector('input');
+      input.checked = false;
+      option.classList.remove('selected');
+    }
+  }
+  refreshSelection();
+}
+
+function selectedPacks() {
+  return [...document.querySelectorAll('[data-region]:checked')].map((input) => [input.dataset.region, packs[input.dataset.region]]);
+}
+
+function refreshSelection() {
+  const selected = selectedPacks();
+  const bytes = selected.reduce((total, entry) => total + entry[1].bytes, 0);
+  byId('selection-title').textContent = selected.length
+    ? `${selected.length} region${selected.length === 1 ? '' : 's'} selected`
+    : 'No packs selected';
+  byId('selection-detail').textContent = selected.length
+    ? `${MB(bytes)}, roughly ${Math.max(1, Math.round(bytes / 1048576 / 3))} minutes over USB.`
+    : (writer ? 'Current packs are left unselected.' : 'Connect a board to compare its SD card.');
+  byId('install').disabled = busy || !writer || !selected.length;
+  // The history list is rebuilt only when it changes, so its Restore buttons
+  // have to be re-gated here or they would keep whatever state they were built
+  // with -- a live button with no board behind it, which is the greyed-but-still-
+  // tappable fault uiButtonDisabled() exists to prevent on the device itself.
+  for (const button of document.querySelectorAll('.history-restore')) {
+    button.disabled = busy || !writer;
+  }
+}
+
+// Reads the board's label out of STATS. Best-effort: firmware from before this
+// existed simply does not print it, and a backup with no board label is still a
+// backup, so nothing here may throw.
+async function queryBoardId() {
+  boardId = '';
+  try {
+    const result = await commandLines('STATS', 6000);
+    for (const line of result.lines) {
+      const match = /^board=([0-9A-Fa-f]{6,16})$/.exec(line.trim());
+      if (match) { boardId = match[1].toUpperCase(); break; }
+    }
+  } catch {
+    // older firmware, or a board mid-restart
+  }
+}
+
+async function queryInstalledPacks() {
+  installedPacks.clear();
+  sdAvailable = true;
+  const result = await commandLines('PACKS', PACK_QUERY_TIMEOUT_MS);
+  if (result.outcome === null) {
+    packProtocol = false;
+    log('The board did not answer PACKS within 20 seconds. Restart it, reconnect, and try Refresh.');
+  } else {
+    packProtocol = true;
+    sdAvailable = result.outcome !== 'ERR';
+    for (const line of result.lines) {
+      const match = /^PACK (\d+) (missing|legacy|[0-9a-fA-F]{8})$/.exec(line);
+      if (match) installedPacks.set(Number(match[1]), match[2].toLowerCase());
+    }
+    for (const [, meta] of sortedPacks()) {
+      if (installedPacks.get(meta.index) === meta.crc32.toLowerCase())
+        verifiedPacks.set(meta.index, meta.crc32.toLowerCase());
+    }
+    if (sdAvailable) {
+      const current = sortedPacks().filter((entry) => installedPacks.get(entry[1].index) === entry[1].crc32.toLowerCase()).length;
+      log(`SD inspected: ${current} of ${Object.keys(packs).length} published packs are current.`);
+    } else {
+      log('The board reports no mounted microSD card.');
+    }
+  }
+  updatePackStatuses();
+}
+
+function parsePak(buffer) {
+  if (buffer.byteLength < 6) throw new Error('bundle is too short');
+  const view = new DataView(buffer);
+  const text = new TextDecoder();
+  if (text.decode(new Uint8Array(buffer, 0, 4)) !== 'TPAK') throw new Error('invalid bundle');
+  const count = view.getUint16(4, true);
+  let offset = 6;
+  const items = [];
+  for (let index = 0; index < count; index++) {
+    if (offset + 1 > buffer.byteLength) throw new Error('truncated bundle index');
+    const nameLength = view.getUint8(offset++);
+    if (!nameLength || offset + nameLength + 4 > buffer.byteLength) throw new Error('invalid bundle index');
+    const name = text.decode(new Uint8Array(buffer, offset, nameLength));
+    offset += nameLength;
+    const size = view.getUint32(offset, true);
+    offset += 4;
+    items.push({ name, size });
+  }
+  let payload = offset;
+  for (const item of items) {
+    if (payload + item.size > buffer.byteLength) throw new Error('truncated bundle payload');
+    item.data = new Uint8Array(buffer, payload, item.size);
+    payload += item.size;
+  }
+  if (payload !== buffer.byteLength) throw new Error('bundle contains trailing data');
+  return items;
+}
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index++) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit++) value = (value >>> 1) ^ (0xEDB88320 & -(value & 1));
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xFFFFFFFF;
+  for (const byte of bytes) crc = CRC_TABLE[(crc ^ byte) & 0xFF] ^ (crc >>> 8);
+  return ((crc ^ 0xFFFFFFFF) >>> 0).toString(16).padStart(8, '0');
+}
+
+function verifyPak(meta, buffer) {
+  if (buffer.byteLength !== meta.bytes) throw new Error(`expected ${meta.bytes} bytes, received ${buffer.byteLength}`);
+  const checksum = crc32(new Uint8Array(buffer));
+  if (checksum !== meta.crc32.toLowerCase()) throw new Error(`checksum ${checksum} does not match ${meta.crc32}`);
+}
+
+async function sendOne(name, data) {
+  await writeLine(`PUT ${name} ${data.length}`);
+  if ((await waitForAny(['OK', 'ERR'])) !== 'OK') return false;
+  for (let offset = 0; offset < data.length; offset += 2048) {
+    await writer.write(data.slice(offset, offset + 2048));
+    if ((await waitForAny(['#', 'ERR'])) !== '#') return false;
+  }
+  return (await waitForAny(['DONE', 'ERR'], 30000)) === 'DONE';
+}
+
+async function sendOneRetrying(name, data) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (await sendOne(name, data)) return true;
+    if (attempt < 3) {
+      log(`Retrying ${name} (${attempt}/2)`);
+      readQueue = [];
+      await pause(250);
+    }
+  }
+  return false;
+}
+
+function showProgress(label, done, total) {
+  const percent = total ? Math.round(done / total * 100) : 0;
+  byId('progress').hidden = false;
+  byId('progress-label').textContent = label;
+  byId('progress-value').textContent = `${percent}%`;
+  byId('progress-fill').style.width = `${percent}%`;
+}
+
+async function sendAll(items, region) {
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    showProgress(`${titleCase(region)} / ${item.name.replace('mons/', '')}`, index, items.length);
+    if (!await sendOneRetrying(item.name, item.data)) {
+      log(`Failed after retries: ${item.name}`);
+      return false;
+    }
+  }
+  showProgress(`${titleCase(region)} complete`, items.length, items.length);
+  return true;
+}
+
+async function loadRegion(region, meta) {
+  log(`Downloading ${titleCase(region)} (${MB(meta.bytes)})...`);
+  const response = await fetch(`sprites-${region}.pak`);
+  if (!response.ok) throw new Error(`HTTP ${response.status} while downloading ${region}`);
+  const buffer = await response.arrayBuffer();
+  verifyPak(meta, buffer);
+  const items = parsePak(buffer);
+  log(`${titleCase(region)} verified (${meta.crc32}); ${items.length} files ready.`);
+
+  if (packProtocol && !await expectDone(`PACK BEGIN ${meta.index}`)) {
+    throw new Error(`board refused to begin the ${region} pack`);
+  }
+  if (!await sendAll(items, region)) return false;
+  if (packProtocol) {
+    if (!await expectDone(`PACK COMMIT ${meta.index} ${meta.crc32}`, PACK_COMMIT_TIMEOUT_MS)) {
+      throw new Error(`files arrived but the board could not validate the ${region} pack`);
+    }
+    installedPacks.set(meta.index, meta.crc32.toLowerCase());
+    verifiedPacks.set(meta.index, meta.crc32.toLowerCase());
+  }
+  log(`${titleCase(region)} is installed and verified.`);
+  return true;
+}
+
+async function restoreVerifiedPackMarkers() {
+  const missing = [...verifiedPacks].filter(([index, crc]) => installedPacks.get(index) !== crc);
+  if (!missing.length) return 0;
+  log(`Restoring ${missing.length} verified pack marker${missing.length === 1 ? '' : 's'}...`);
+  for (const [index, crc] of missing) {
+    if (!await expectDone(`PACK BEGIN ${index}`) ||
+        !await expectDone(`PACK COMMIT ${index} ${crc}`, PACK_COMMIT_TIMEOUT_MS)) {
+      throw new Error(`could not restore the version marker for region ${index}`);
+    }
+    installedPacks.set(index, crc);
+  }
+  log(`Restored ${missing.length} verified pack marker${missing.length === 1 ? '' : 's'}.`);
+  return missing.length;
+}
+
+function downloadText(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = name;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+// Reads the save off the board and VERIFIES it before handing it back.
+//
+// The verification is the point. The previous version accepted the capture if it
+// had seen at least one chunk and a closing commit line, which a TRUNCATED read
+// also satisfies -- so a short capture was downloaded and presented as a backup.
+// verifyBackup() compares the byte count the board declared against the hex that
+// actually arrived and checks the checksum, and it is the same function that
+// vets a file on the way back in.
+//
+// Throws with a reason. A caller must never treat an unverified capture as a
+// backup: that is the one failure mode a backup feature cannot recover from.
+async function captureSave() {
+  readQueue = [];
+  await writeLine('EXPORT');
+  const lines = [];
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const line = await readLine(deadline - Date.now());
+    if (line === null) throw new Error('the board did not finish the export');
+    if (line === 'EXPORT FAIL') throw new Error('the firmware could not build a backup');
+    if (line.startsWith('# TamaPoke save') || line.startsWith('IMPORT ')) lines.push(line);
+    if (line === 'IMPORT') {
+      lines.push(line);
+      break;
+    }
+  }
+  if (lines.at(-1) !== 'IMPORT') throw new Error('the export stopped before the end');
+  const text = `${lines.join('\n')}\n`;
+  const parsed = verifyBackup(text);           // throws if it is not sound
+  return { text, parsed, describe: describeBackup(parsed.blob) };
+}
+
+async function backupSave() {
+  setBusy(true);
+  try {
+    const capture = await captureSave();
+    await storeBackup(capture);
+    downloadCapture(capture);
+    log(`Save backup verified and downloaded (${capture.parsed.blob.length} bytes, `
+        + `${capture.parsed.fields} fields).`);
+  } catch (error) {
+    log(`Backup failed: ${error.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function backupFileName(capture) {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  const who = capture.describe?.trainer?.replace(/[^A-Za-z0-9]/g, '') || 'save';
+  return `tamapoke-${who}-${stamp}.tpsave`;
+}
+
+function downloadCapture(capture) {
+  downloadText(backupFileName(capture), capture.text);
+}
+
+// ---------------------------------------------------------------------------
+// Backup history, kept in this browser.
+//
+// IndexedDB rather than localStorage: it is asynchronous, it stores structured
+// values without stringifying them, and it is not sharing a ~5 MB synchronous
+// budget with everything else on the origin. A save is only a couple of KB so
+// neither would run out, but there is no reason to pick the one that blocks.
+//
+// THIS IS A CONVENIENCE, NOT A BACKUP, and the page says so. It lives in one
+// browser profile on one machine and it is deleted by "clear site data", by
+// private browsing, and by moving to another computer. That is why every capture
+// is also written to disk as a file: the file is the backup, and this is the
+// thing that makes restoring a moment's work instead of a search through
+// Downloads. Presenting it as durable would be worse than not having it.
+const DB_NAME = 'tamapoke-saves';
+const DB_STORE = 'backups';
+const HISTORY_LIMIT = 12;
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) {
+        db.createObjectStore(DB_STORE, { keyPath: 'id', autoIncrement: true });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('could not open the backup database'));
+  });
+}
+
+function txDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('the backup database rejected the write'));
+    tx.onabort = () => reject(tx.error || new Error('the backup database aborted'));
+  });
+}
+
+async function storeBackup(capture) {
+  try {
+    const db = await openDb();
+    const record = {
+      at: Date.now(),
+      text: capture.text,
+      bytes: capture.parsed.blob.length,
+      board: boardId,
+      trainer: capture.describe?.trainer || '',
+      dex: capture.describe?.dex ?? null,
+      ageMinutes: capture.describe?.ageMinutes ?? null,
+    };
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).add(record);
+    await txDone(tx);
+    await pruneBackups(db);
+    db.close();
+    await renderHistory();
+  } catch (error) {
+    // A capture that is verified and downloaded is still a good backup even if
+    // the history could not be written -- private browsing blocks IndexedDB
+    // entirely, and failing the whole operation for that would be perverse.
+    log(`Backup saved and downloaded, but this browser would not store a copy: ${error.message}`);
+  }
+}
+
+async function listBackups() {
+  try {
+    const db = await openDb();
+    const rows = await new Promise((resolve, reject) => {
+      const request = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return rows.sort((a, b) => b.at - a.at);
+  } catch {
+    return [];
+  }
+}
+
+async function pruneBackups(db) {
+  const rows = await new Promise((resolve, reject) => {
+    const request = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  const doomed = rows.sort((a, b) => b.at - a.at).slice(HISTORY_LIMIT);
+  if (!doomed.length) return;
+  const tx = db.transaction(DB_STORE, 'readwrite');
+  for (const row of doomed) tx.objectStore(DB_STORE).delete(row.id);
+  await txDone(tx);
+}
+
+async function clearBackups() {
+  try {
+    const db = await openDb();
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).clear();
+    await txDone(tx);
+    db.close();
+  } catch (error) {
+    log(`Could not clear the history: ${error.message}`);
+  }
+}
+
+function historyLabel(row) {
+  const when = new Date(row.at).toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+  const bits = [];
+  if (row.trainer) bits.push(row.trainer);
+  if (row.dex && row.dex > 0) bits.push(`dex ${row.dex}`);
+  if (row.ageMinutes) bits.push(`Lv.${Math.min(100, 1 + Math.floor(row.ageMinutes / 60))}`);
+  bits.push(`${row.bytes} bytes`);
+  if (row.board) bits.push(`board ${row.board}`);
+  return { when, detail: bits.join(' \u00b7 ') };
+}
+
+async function renderHistory() {
+  const host = byId('history');
+  if (!host) return;
+  const rows = await listBackups();
+  host.textContent = '';
+  byId('history-clear').disabled = !rows.length;
+  if (!rows.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No backups stored in this browser yet.';
+    host.append(empty);
+    return;
+  }
+  for (const row of rows) {
+    const { when, detail } = historyLabel(row);
+    const item = document.createElement('div');
+    item.className = 'history-row';
+
+    const copy = document.createElement('div');
+    const title = document.createElement('strong');
+    title.textContent = when;
+    const sub = document.createElement('p');
+    sub.className = 'muted';
+    sub.textContent = detail;
+    copy.append(title, sub);
+
+    const actions = document.createElement('div');
+    actions.className = 'history-actions';
+
+    const restore = document.createElement('button');
+    restore.className = 'button button-secondary history-restore';
+    restore.textContent = 'Restore';
+    restore.disabled = busy || !writer;
+    restore.addEventListener('click', () => void restoreText(row.text, `the backup from ${when}`));
+
+    const save = document.createElement('button');
+    save.className = 'button button-secondary';
+    save.textContent = 'Download';
+    save.addEventListener('click', () => {
+      const stamp = new Date(row.at).toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      const who = row.trainer?.replace(/[^A-Za-z0-9]/g, '') || 'save';
+      downloadText(`tamapoke-${who}-${stamp}.tpsave`, row.text);
+    });
+
+    actions.append(restore, save);
+    item.append(copy, actions);
+    host.append(item);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Back up, then flash.
+//
+// The whole reason this exists: "make a backup first" is advice, and advice gets
+// skipped. Doing it as part of the flash is the only version that actually
+// happens.
+//
+// It cannot be one connection. The firmware install is esp-web-tools' own custom
+// element and it calls requestPort() and owns the port for the duration, which is
+// why the page has always told people to close that dialog before connecting
+// here. So the order is: use OUR connection to read the save, release the port
+// properly, and only then hand over. releasePort() exists for this.
+//
+// The browser may ask which board to use twice -- once for us, once for the
+// installer -- and there is nothing to be done about that from here, so the page
+// says it will happen rather than letting it surprise anyone.
+//
+// It does NOT click the installer for you, and that is not an oversight -- it
+// was tried, and it silently did nothing. navigator.serial.requestPort(), which
+// esp-web-tools calls internally, needs a live, direct user gesture, and a
+// synthetic click fired after this function's awaits -- especially
+// downloadCapture()'s real file download, itself a gesture-consuming action --
+// arrives too late for the browser to still count it as one. Chrome logs
+// nothing when that happens; it just never opens a port chooser, which reads
+// exactly like a hang. So this stops at the backup and hands the actual click
+// back to the player: promptInstall() reveals the real "Install update"
+// button, and a genuine click on THAT is what starts the flash.
+async function backupThenFlash() {
+  resetInstallPrompt();
+  setBusy(true);
+  let captured = false;
+  try {
+    if (!writer) {
+      log('Connecting to read the current save before flashing...');
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 115200 });
+      reader = port.readable.getReader();
+      writer = port.writable.getWriter();
+      readCarry = '';
+      readQueue = [];
+      void pumpSerial(reader);
+      setConnected(true);
+    }
+    try {
+      const capture = await captureSave();
+      await storeBackup(capture);
+      downloadCapture(capture);
+      captured = true;
+      log(`Backup verified (${capture.parsed.blob.length} bytes) and downloaded. Click Install update to flash.`);
+    } catch (error) {
+      // A board with nothing to back up is the normal case for a NEW one, and a
+      // board in download mode is not running firmware at all so nothing answers
+      // EXPORT. Neither is a reason to stand between the player and a flash --
+      // say what happened and point at Install update instead of guessing for them.
+      log(`No backup taken: ${error.message}. Click Install update to flash.`);
+    }
+  } catch (error) {
+    log(`Could not connect for a backup: ${error.message}. Click Install update to flash.`);
+  } finally {
+    await releasePort(captured ? 'Backed up; Install update is ready' : 'Install update is ready');
+    setBusy(false);
+  }
+  promptInstall();
+}
+
+// Reveals the real "Install update" button rather than trying to click it for
+// the player -- see backupThenFlash()'s comment for why a synthetic click does
+// not work. The backup button dims (not disabled -- running it again resets
+// both, for a second board) and its label changes entirely, pointing at the
+// button that just appeared.
+function promptInstall() {
+  const step2 = byId('install-step2');
+  if (step2) step2.hidden = false;
+  const step1 = byId('backup-flash');
+  const label = byId('backup-flash-label');
+  if (step1) step1.classList.add('button-dim');
+  if (label) label.textContent = 'Backup complete, now →';
+  if (window.lucide) lucide.createIcons();
+}
+
+// Back to the starting state at the beginning of a fresh backup attempt, so
+// this cannot linger stale across a failed connection or a second board.
+function resetInstallPrompt() {
+  const step2 = byId('install-step2');
+  if (step2) step2.hidden = true;
+  const step1 = byId('backup-flash');
+  const label = byId('backup-flash-label');
+  if (step1) step1.classList.remove('button-dim');
+  if (label) label.textContent = 'Backup, then install';
+}
+
+async function restoreText(text, label) {
+  let commands;
+  try {
+    ({ commands } = verifyBackup(text));
+  } catch (error) {
+    log(`Restore refused before upload: ${error.message}`);
+    return;
+  }
+  if (!window.confirm(`Replace the save on the connected board with ${label}? The board will restart after validation.`)) return;
+
+  setBusy(true);
+  try {
+    readQueue = [];
+    // The protocol lives in savefile.js so it can be tested without a board; this
+    // only supplies the I/O. See sendBackup() for why the acknowledgement is
+    // detected rather than assumed.
+    await sendBackup(commands, {
+      writeLine,
+      waitForAny,
+      pause,
+      log,
+      resetQueue: () => { readQueue = []; },
+    });
+    log('Save validated and restored. The board is restarting.');
+    // A restart drops the USB device, so the port is gone whether we tidy up or
+    // not -- releasing it properly means reconnecting works without a reload.
+    await releasePort('Board restarting');
+  } catch (error) {
+    log(`Restore failed: ${error.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+byId('connect').addEventListener('click', async () => {
+  try {
+    setBusy(true);
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+    readCarry = '';
+    readQueue = [];
+    void pumpSerial(reader);
+    setConnected(true);
+    log('Board connected. Reading the microSD pack catalogue...');
+    await queryBoardId();
+    await renderHistory();
+    await queryInstalledPacks();
+  } catch (error) {
+    log(`Could not connect: ${error.message}`);
+    setConnected(false);
+  } finally {
+    setBusy(false);
+  }
+});
+
+byId('refresh-packs').addEventListener('click', async () => {
+  setBusy(true);
+  try { await queryInstalledPacks(); }
+  catch (error) { log(`Pack refresh failed: ${error.message}`); }
+  finally { setBusy(false); }
+});
+
+byId('select-needed').addEventListener('click', () => {
+  for (const option of document.querySelectorAll('.pack-option')) {
+    const input = option.querySelector('input');
+    input.checked = option.dataset.needed === 'true';
+    option.classList.toggle('selected', input.checked);
+  }
+  refreshSelection();
+});
+
+byId('install').addEventListener('click', async () => {
+  const selected = selectedPacks();
+  if (!selected.length || !writer) return;
+  setBusy(true);
+  let completed = 0;
+  try {
+    for (const [region, meta] of selected) {
+      if (!await loadRegion(region, meta)) break;
+      completed++;
+    }
+    if (packProtocol && completed === selected.length) {
+      await queryInstalledPacks();
+      if (await restoreVerifiedPackMarkers()) await queryInstalledPacks();
+    }
+    log(completed === selected.length
+      ? `All ${completed} selected regions are ready. Restart the board to reload thumbnails.`
+      : `Stopped after ${completed} of ${selected.length} regions.`);
+  } catch (error) {
+    log(`Install stopped: ${error.message}`);
+  } finally {
+    updatePackStatuses();
+    setBusy(false);
+  }
+});
+
+byId('files').addEventListener('change', async (event) => {
+  const files = [...event.target.files];
+  if (!files.length) return;
+  setBusy(true);
+  try {
+    if (packProtocol) {
+      for (const [, meta] of sortedPacks()) await expectDone(`PACK BEGIN ${meta.index}`);
+    }
+    const items = [];
+    for (const file of files) items.push({ name: `mons/${file.name}`, data: new Uint8Array(await file.arrayBuffer()) });
+    const ok = await sendAll(items, 'custom files');
+    log(ok ? `${items.length} custom files installed. Pack versions are now marked unverified.` : 'Custom file transfer failed.');
+    await queryInstalledPacks();
+  } catch (error) {
+    log(`Custom file transfer failed: ${error.message}`);
+  } finally {
+    event.target.value = '';
+    setBusy(false);
+  }
+});
+
+byId('backup').addEventListener('click', backupSave);
+byId('restore').addEventListener('change', (event) => {
+  const [file] = event.target.files;
+  if (file) void file.text().then((text) => restoreText(text, file.name));
+  event.target.value = '';
+});
+byId('backup-flash').addEventListener('click', backupThenFlash);
+// Forwards SYNCHRONOUSLY, with no await in between -- that is what makes this
+// different from backupThenFlash()'s old, broken auto-click. A real, direct
+// click's transient activation survives a same-tick synthetic click just fine;
+// it is only lost across the async gap a backup needs. The real "Install
+// update" button is `hidden` until a backup attempt reveals it, but hidden
+// elements can still be .click()'d, so this reaches it either way.
+byId('install-skip').addEventListener('click', () => {
+  document.querySelector('#flash-button [slot="activate"]').click();
+});
+byId('history-clear').addEventListener('click', async () => {
+  if (!window.confirm('Delete every backup stored in this browser? The .tpsave files you downloaded are not affected.')) return;
+  await clearBackups();
+  await renderHistory();
+  log('Browser backup history cleared.');
+});
+byId('clear-log').addEventListener('click', () => { logElement.textContent = ''; });
+
+void renderHistory();   // the list is worth showing before anything is connected
+
+if (!('serial' in navigator)) byId('unsupported').hidden = false;
+if ('serial' in navigator) {
+  navigator.serial.addEventListener('disconnect', () => setConnected(false, 'Board disconnected'));
+}
+
+await Promise.all([loadEditions(), loadPacks()]);
+syncControls();
+refreshIcons();
