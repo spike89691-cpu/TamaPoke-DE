@@ -27,7 +27,7 @@ jobs:
           arduino-cli core list | grep -F "3.3.11"
           arduino-cli lib update-index
           arduino-cli lib install "GFX Library for Arduino"
-          arduino-cli lib install "SensorLib"
+          arduino-cli lib install "SensorLib@0.4.1"
           arduino-cli lib install "XPowersLib"
 
       - name: Deutsche Namen und JS-Sicherungen prüfen
