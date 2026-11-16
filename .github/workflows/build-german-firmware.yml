@@ -23,7 +23,8 @@ jobs:
           set -euo pipefail
           URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index --additional-urls "$URL"
-          arduino-cli core install esp32:esp32 --additional-urls "$URL"
+          arduino-cli core install esp32:esp32@3.3.11 --additional-urls "$URL"
+          arduino-cli core list | grep -F "3.3.11"
           arduino-cli lib update-index
           arduino-cli lib install "GFX Library for Arduino"
           arduino-cli lib install "SensorLib"
@@ -43,9 +44,6 @@ jobs:
           FQBN='esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB'
           mkdir -p "$RUNNER_TEMP/esp32-build"
           arduino-cli compile --fqbn "$FQBN" --output-dir "$RUNNER_TEMP/esp32-build" .
-          BOOT_APP=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -type f -name boot_app0.bin -print -quit)
-          test -f "$BOOT_APP"
-          cp "$BOOT_APP" "$RUNNER_TEMP/esp32-build/boot_app0.bin"
           ls -lah "$RUNNER_TEMP/esp32-build"
 
       - name: Sicheres Web-Flash-Paket bauen und prüfen
