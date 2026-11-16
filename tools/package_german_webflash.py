@@ -14,10 +14,10 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 PARTS = (
-    ('TamaPoke.ino.bootloader.bin', 'bootloader.bin', 0x0),
-    ('TamaPoke.ino.partitions.bin', 'partitions.bin', 0x8000),
+    ('TamaPoke-DE.ino.bootloader.bin', 'bootloader.bin', 0x0),
+    ('TamaPoke-DE.ino.partitions.bin', 'partitions.bin', 0x8000),
     ('boot_app0.bin', 'boot_app0.bin', 0xE000),
-    ('TamaPoke.ino.bin', 'app.bin', 0x10000),
+    ('TamaPoke-DE.ino.bin', 'app.bin', 0x10000),
 )
 
 HTML = '''<!doctype html>
@@ -66,7 +66,7 @@ def package(built: Path, destination: Path):
         if start < nvs_end and nvs_start < end:
             raise SystemExit(f'UNSAFE: {file_name} 0x{start:x}..0x{end:x} overwrites NVS')
 
-    source = (ROOT / 'TamaPoke.ino').read_text(encoding='utf-8')
+    source = (ROOT / 'TamaPoke-DE.ino').read_text(encoding='utf-8')
     firmware_version = re.search(r'#define FW_VERSION\s+"([^"]+)"', source)
     if not firmware_version:
         raise SystemExit('FW_VERSION in der Firmware nicht gefunden')
