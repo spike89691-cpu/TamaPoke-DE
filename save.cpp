@@ -45,6 +45,7 @@ const SaveField SAVE_FIELDS[] = {
   { "rivals", SK_BYTES },
   // settings, so a restored device plays the way it did
   { "lang", SK_U8 },    { "snd", SK_BOOL },   { "vol", SK_U8 },
+  { "rotate", SK_BOOL },
 };
 const uint16_t SAVE_FIELD_COUNT = sizeof(SAVE_FIELDS) / sizeof(SAVE_FIELDS[0]);
 

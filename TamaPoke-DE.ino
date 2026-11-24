@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include "Arduino_GFX_Library.h"
 #include "TouchDrvCSTXXX.hpp"
 #include "pin_config.h"
@@ -49,7 +50,7 @@ static inline const char *pokemonNameOf(const DexEntry &entry) {
 
 // Version del firmware. Subir este numero en cada release (y manifest.json para
 // el instalador web). Se muestra en la pantalla de ajustes y por serie al arrancar.
-#define FW_VERSION "3.28"  // aligns with README and supplied firmware app.bin
+#define FW_VERSION "3.28-DE.1"  // German names and persistent display rotation
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
   LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
@@ -57,6 +58,35 @@ Arduino_CO5300 *panel = new Arduino_CO5300(
   bus, LCD_RESET, 0 /*rotation*/, LCD_WIDTH, LCD_HEIGHT, 6, 0, 0, 0);
 // Framebuffer completo en PSRAM: dibujamos todo y hacemos flush() (sin parpadeo)
 Arduino_Canvas *gfx = new Arduino_Canvas(LCD_WIDTH, LCD_HEIGHT, panel);
+
+static bool displayRotated = false;
+
+void loadDisplayRotation() {
+  Preferences p;
+  displayRotated = false;  // existing saves keep their original orientation
+  if (p.begin("tamapoke", true)) {
+    displayRotated = p.getBool("rotate", false);
+    p.end();
+  }
+  gfx->setRotation(displayRotated ? 2 : 0);
+}
+
+bool setDisplayRotated(bool rotated) {
+  Preferences p;
+  if (!p.begin("tamapoke", false)) {
+    logKeyFailure("display", "rotate");
+    return false;
+  }
+  bool saved = p.putBool("rotate", rotated) == 1;
+  if (!saved) logKeyFailure("display", "rotate");
+  p.end();
+  if (saved) {
+    displayRotated = rotated;
+    // Rotate the canvas so every screen uses the same panel offsets.
+    gfx->setRotation(rotated ? 2 : 0);
+  }
+  return saved;
+}
 
 TouchDrvCST92xx touch;
 Pet pet;
@@ -924,6 +954,7 @@ void setup() {
   // QSPI a 80MHz (por defecto 40): el flush del framebuffer es el cuello de
   // botella del fps (~56ms a 40MHz). Si el panel mostrara basura, bajar a 40M.
   if (!gfx->begin(80000000)) Serial.println("gfx->begin() failed");
+  loadDisplayRotation();
   panel->setBrightness(180);
 
   touch.setPins(TP_RESET, TP_INT);
@@ -1507,6 +1538,11 @@ void handleTouch() {
   gTouchIrq = false;
   int16_t x, y;
   bool pressed = touch.getPoint(&x, &y, 1) > 0;
+  if (pressed && displayRotated) {
+    // Convert physical touches before resolving taps, holds and swipes.
+    x = LCD_WIDTH - 1 - x;
+    y = LCD_HEIGHT - 1 - y;
+  }
 
   // saco de entrenamiento: cada toque cuenta al instante (aporrear rapido)
   if (sackOpen) {
@@ -3546,6 +3582,12 @@ void drawClockBtn(int x, int y, const char *l) {
 #define VOL_MINUS_X 146
 #define VOL_PLUS_X 276
 #define VOL_BTN_W 48
+#define ROTATE_BTN_X 70
+#define ROTATE_BTN_Y 340
+#define ROTATE_BTN_W 230
+#define ROTATE_BTN_H 48
+#define CLOCK_OK_X 316
+#define CLOCK_OK_W 80
 static const char *const LANG_CODES[LANG_COUNT] = { "ES", "EN", "FR", "DE", "IT", "PT" };
 
 void renderClock() {
@@ -3619,10 +3661,25 @@ void renderClock() {
   gfx->setCursor(LANG_PILL_X + (LANG_PILL_W - (int)strlen(lp) * 12) / 2, LANG_PILL_Y + 8);
   gfx->print(lp);
 
-  gfx->fillRoundRect(133, 340, 200, 48, 14, UI_BAR_OK);
+  gfx->fillRoundRect(ROTATE_BTN_X, ROTATE_BTN_Y, ROTATE_BTN_W, ROTATE_BTN_H, 14, UI_WHITE);
+  gfx->drawRoundRect(ROTATE_BTN_X, ROTATE_BTN_Y, ROTATE_BTN_W, ROTATE_BTN_H, 14, UI_INK);
+  gfx->setTextColor(UI_INK);
+  gfx->setTextSize(2);
+  gfx->setCursor(ROTATE_BTN_X + (ROTATE_BTN_W - (int)strlen(T(S_DISPLAY_ROTATE)) * 12) / 2,
+                 ROTATE_BTN_Y + 8);
+  gfx->print(T(S_DISPLAY_ROTATE));
+  char angle[4];
+  snprintf(angle, sizeof(angle), "%u", displayRotated ? 180u : 0u);
+  int angleX = ROTATE_BTN_X + (ROTATE_BTN_W - ((int)strlen(angle) * 6 + 6)) / 2;
+  gfx->setTextSize(1);
+  gfx->setCursor(angleX, ROTATE_BTN_Y + 30);
+  gfx->print(angle);
+  gfx->drawCircle(angleX + (int)strlen(angle) * 6 + 2, ROTATE_BTN_Y + 31, 2, UI_INK);
+
+  gfx->fillRoundRect(CLOCK_OK_X, ROTATE_BTN_Y, CLOCK_OK_W, ROTATE_BTN_H, 14, UI_BAR_OK);
   gfx->setTextColor(UI_BG_DAY);
   gfx->setTextSize(3);
-  gfx->setCursor(CX - 18, 352);
+  gfx->setCursor(CLOCK_OK_X + (CLOCK_OK_W - 36) / 2, ROTATE_BTN_Y + 12);
   gfx->print("OK");
 
   gfx->setTextColor(UI_INK_SOFT);
@@ -3669,7 +3726,13 @@ void clockTap(int16_t x, int16_t y) {
       return;
     }
   }
-  if (y >= 340 && y <= 388 && x >= 133 && x <= 333) { applyClock(); return; }
+  if (y >= ROTATE_BTN_Y && y < ROTATE_BTN_Y + ROTATE_BTN_H) {
+    if (x >= ROTATE_BTN_X && x < ROTATE_BTN_X + ROTATE_BTN_W) {
+      if (setDisplayRotated(!displayRotated)) sfxPlay(SFX_TAP);
+      return;
+    }
+    if (x >= CLOCK_OK_X && x < CLOCK_OK_X + CLOCK_OK_W) { applyClock(); return; }
+  }
 }
 
 // llama + numero de racha arriba a la izquierda

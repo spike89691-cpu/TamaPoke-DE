@@ -33,17 +33,23 @@ public:
   int16_t cx = 0, cy = 0;
   uint16_t textColor = 0xFFFF;
   uint8_t textSize = 1;
+  uint8_t rotation = 0;
   volatile bool frameReady = false;
 
   Arduino_Canvas(int16_t w, int16_t h, Arduino_CO5300 *p)
       : _w(w), _h(h), _panel(p), fb(w * h, 0) {}
 
   bool begin(uint32_t = 0) { return true; }
+  void setRotation(uint8_t value) { rotation = value & 3; }
   void flush() { frameReady = true; }
   const uint16_t *buffer() const { return fb.data(); }
 
   inline void px(int x, int y, uint16_t c) {
     if (x < 0 || y < 0 || x >= _w || y >= _h) return;
+    if (rotation == 2) {
+      x = _w - 1 - x;
+      y = _h - 1 - y;
+    }
     fb[(size_t)y * _w + x] = c;
   }
 

@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 # Die Boot-Dateien stammen aus dem ORIGINAL, das auf dem Gerät funktioniert hat.
@@ -117,21 +118,21 @@ def package(built: Path, destination: Path):
     if not firmware_version:
         raise SystemExit('FW_VERSION in der Firmware nicht gefunden')
     version = firmware_version.group(1)
-    if version != '3.28':
+    if version not in ('3.28', '3.28-DE.1'):
         raise SystemExit(f'Firmwareversion unerwartet: {version}')
     manifest = {
-        'name': 'TamaPoke – deutsche Pokémon-Namen (Test, Core 3.3.11)',
+        'name': f'TamaPoke DE {version} – Display drehen',
         'version': version,
         'new_install_prompt_erase': True,
         'builds': [{'chipFamily': 'ESP32-S3', 'parts': parts}],
     }
     (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
-    (destination / 'index.html').write_text(HTML.replace('TamaPoke – deutsche Pokémon-Namen', 'TamaPoke – deutsche Pokémon-Namen (Testbuild)').replace(
+    (destination / 'index.html').write_text(HTML.replace('TamaPoke – deutsche Pokémon-Namen', f'TamaPoke DE {version} – Display drehen').replace(
         '<small>Nur für die oben genannte Hardware.',
         '<small>Ungetestete Anpassung: Bitte Original-Installer zur Wiederherstellung bereithalten. Nur für die oben genannte Hardware.'
     ), encoding='utf-8')
 
-    subprocess.run(['python3', str(ROOT / 'tools/check_installer.py'),
+    subprocess.run([sys.executable, str(ROOT / 'tools/check_installer.py'),
                     str(destination / 'manifest.json')], check=True)
     print('OK: altes Bootloader-/Partitions-Paket mit neuer App und Core 3.3.11')
 
